@@ -1,5 +1,7 @@
 # BVB Monitor
 
+![BVB Monitor App](BvbMonitor.png)
+
 Aceasta este o aplicație asistent / widget desktop pentru monitorizarea bursei de valori (BVB) din România. Ea extrage și afișează intraday cele mai recente prețuri, variații și grafice tip „sparkline” ale celor mai tranzacționate acțiuni, plus informații despre principalii indici bursieri (inclusiv evidențierea companiilor din componența indicelui BET).
 
 ## Caracteristici

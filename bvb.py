@@ -16,9 +16,10 @@ import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
 from datetime import datetime
 import hashlib
-import winreg
 import ctypes
 import sys
+
+INTERNAL_VERSION = "1.0.22" # This line is automatically updated by the script
 
 def get_app_path():
     # Returns the folder where the script or .exe is located
@@ -52,53 +53,69 @@ def get_windows_theme():
     except Exception:
         return "light" # Default fallback
 def get_app_version():
+    global INTERNAL_VERSION
     version_file = os.path.join(BASE_PATH, "data", "version.json")
     script_file = os.path.join(BASE_PATH, "bvb.py")
     
-    # If running as EXE (frozen), we don't increment version automatically based on hash
-    # because the source .py file might not be exactly where we expect or might be static.
     is_exe = hasattr(sys, 'frozen')
+    if is_exe:
+        return INTERNAL_VERSION
     
+    # Calculate current script hash
     current_hash = ""
-    if not is_exe:
-        hasher = hashlib.md5()
-        try:
-            if os.path.exists(script_file):
-                with open(script_file, 'rb') as f:
-                    buf = f.read()
-                    hasher.update(buf)
-                current_hash = hasher.hexdigest()
-        except Exception:
-            pass
+    hasher = hashlib.md5()
+    try:
+        if os.path.exists(script_file):
+            with open(script_file, 'rb') as f:
+                buf = f.read()
+                hasher.update(buf)
+            current_hash = hasher.hexdigest()
+    except Exception:
+        pass
         
     try:
+        saved_hash = ""
+        version = INTERNAL_VERSION
+        
         if os.path.exists(version_file):
             with open(version_file, 'r') as f:
                 data = json.load(f)
                 saved_hash = data.get("hash", "")
-                version = data.get("version", "1.0.1")
+                version = data.get("version", INTERNAL_VERSION)
                 
-            if not is_exe and current_hash and current_hash != saved_hash:
-                parts = version.split('.')
-                if len(parts) == 3:
-                    parts[-1] = str(int(parts[-1]) + 1)
-                    new_version = ".".join(parts)
-                else:
-                    new_version = version + ".1"
+        if current_hash and current_hash != saved_hash:
+            parts = version.split('.')
+            if len(parts) == 3:
+                parts[-1] = str(int(parts[-1]) + 1)
+                new_version = ".".join(parts)
+            else:
+                new_version = version + ".1"
+            
+            # SELF-UPDATE: Rewrite bvb.py with the new version constant
+            try:
+                if os.path.exists(script_file):
+                    with open(script_file, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
                     
-                with open(version_file, 'w') as f:
-                    json.dump({"version": new_version, "hash": current_hash}, f, indent=4)
-                return new_version
-            return version
-        else:
+                    with open(script_file, 'w', encoding='utf-8') as f:
+                        for line in lines:
+                            if line.startswith('INTERNAL_VERSION = "'):
+                                f.write(f'INTERNAL_VERSION = "{new_version}" # This line is automatically updated by the script\n')
+                            else:
+                                f.write(line)
+            except Exception:
+                pass
+
+            # Update JSON backup
             if not os.path.exists(os.path.join(BASE_PATH, "data")):
                 os.makedirs(os.path.join(BASE_PATH, "data"))
-            version = "1.0.1"
             with open(version_file, 'w') as f:
-                json.dump({"version": version, "hash": current_hash}, f, indent=4)
-            return version
+                json.dump({"version": new_version, "hash": current_hash}, f, indent=4)
+            
+            return new_version
+        return version
     except Exception:
-        return "1.0.1"
+        return INTERNAL_VERSION
 
 APP_VERSION = get_app_version()
 

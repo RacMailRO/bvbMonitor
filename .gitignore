@@ -1,6 +1,25 @@
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+
+# Virtual Environments
 venv/
 env/
+.venv/
 .env
+venv*/
+auto-py-to-exe/
+# Build outputs
+build/
+dist/
+*.spec
+*.exe
+
+# App specific
+.bvb_monitor/
+
+executabil
+output
+bvb.build
+bvb.cmd

@@ -1,14 +1,17 @@
 # BVB Monitor
 
 ![BVB Monitor App](BvbMonitor.png)
+![BVB Monitor Dark Mode](BvbMonitor-dark.png)
 
 Aceasta este o aplicație asistent / widget desktop pentru monitorizarea bursei de valori (BVB) din România. Ea extrage și afișează intraday cele mai recente prețuri, variații și grafice tip „sparkline” ale celor mai tranzacționate acțiuni, plus informații despre principalii indici bursieri (inclusiv evidențierea companiilor din componența indicelui BET).
 
 ## Caracteristici
-- Extrage prețurile de piață și calculează automat variațiile intraday.
-- Evidențiază prin culoare și un „*” acțiunile care fac parte din indicele principal BET (componentele sunt extrase dinamic).
-- Afișează grafice „sparkline” pentru evoluția prețurilor în ziua curentă, inclusiv un tooltip cu detalii orare ale prețului și variației.
-- Fiecare simbol din tabel permite deschiderea directă în browser a detaliilor aferente de pe site-ul BVB, printr-un simplu click pe el.
+- **Mod Întunecat (Dark Mode)**: Comutare manuală între teme (Dark/Light) și detecție automată a temei Windows, inclusiv bara de titlu neagră pentru un aspect premium.
+- **Animații Fluide**: Evidențierea rândurilor actualizate cu un efect de „solid-hold” urmat de un „fade” lin (estompare treptată).
+- **Tooltip Plutitor Inteligent**: Graficele din tabel și fereastra de detalii oferă informații precise prin tooltips care urmăresc cursorul mouse-ului.
+- **Grafic Detaliat**: Click pe graficul unui simbol pentru a deschide o fereastră mare cu evoluția intraday completă, crosshair și detalii exacte.
+- **Integrare BVB**: Evidențiază componentele indicelui BET (cu „*”) și oferă link-uri directe către site-ul BVB pentru fiecare simbol.
+- **Acuratețe**: Extrage prețurile în timp real și calculează variațiile intraday față de prețul de referință.
 
 ## Cerințe
 - Python 3

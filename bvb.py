@@ -18,6 +18,15 @@ from datetime import datetime
 import hashlib
 import winreg
 import ctypes
+import sys
+
+def get_app_path():
+    # Returns the folder where the script or .exe is located
+    if hasattr(sys, 'frozen'):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_PATH = get_app_path()
 
 def set_dark_title_bar(window):
     # Enable dark title bar on Windows 10 (1809+) and Windows 11
@@ -43,18 +52,24 @@ def get_windows_theme():
     except Exception:
         return "light" # Default fallback
 def get_app_version():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    version_file = os.path.join(script_dir, "data", "version.json")
-    script_file = os.path.join(script_dir, "bvb.py")
+    version_file = os.path.join(BASE_PATH, "data", "version.json")
+    script_file = os.path.join(BASE_PATH, "bvb.py")
     
-    hasher = hashlib.md5()
-    try:
-        with open(script_file, 'rb') as f:
-            buf = f.read()
-            hasher.update(buf)
-        current_hash = hasher.hexdigest()
-    except Exception:
-        return "1.0.1"
+    # If running as EXE (frozen), we don't increment version automatically based on hash
+    # because the source .py file might not be exactly where we expect or might be static.
+    is_exe = hasattr(sys, 'frozen')
+    
+    current_hash = ""
+    if not is_exe:
+        hasher = hashlib.md5()
+        try:
+            if os.path.exists(script_file):
+                with open(script_file, 'rb') as f:
+                    buf = f.read()
+                    hasher.update(buf)
+                current_hash = hasher.hexdigest()
+        except Exception:
+            pass
         
     try:
         if os.path.exists(version_file):
@@ -63,7 +78,7 @@ def get_app_version():
                 saved_hash = data.get("hash", "")
                 version = data.get("version", "1.0.1")
                 
-            if current_hash != saved_hash:
+            if not is_exe and current_hash and current_hash != saved_hash:
                 parts = version.split('.')
                 if len(parts) == 3:
                     parts[-1] = str(int(parts[-1]) + 1)
@@ -76,8 +91,8 @@ def get_app_version():
                 return new_version
             return version
         else:
-            if not os.path.exists("data"):
-                os.makedirs("data")
+            if not os.path.exists(os.path.join(BASE_PATH, "data")):
+                os.makedirs(os.path.join(BASE_PATH, "data"))
             version = "1.0.1"
             with open(version_file, 'w') as f:
                 json.dump({"version": version, "hash": current_hash}, f, indent=4)
@@ -87,7 +102,7 @@ def get_app_version():
 
 APP_VERSION = get_app_version()
 
-DATA_DIR = "data"
+DATA_DIR = os.path.join(BASE_PATH, "data")
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 

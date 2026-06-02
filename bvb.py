@@ -2,11 +2,14 @@ import tkinter as tk
 from tkinter import ttk
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from io import StringIO
 from datetime import datetime, time, date
 import re
 import json
 import os
+import winreg
 import webbrowser
 import matplotlib
 matplotlib.use("TkAgg")
@@ -18,8 +21,11 @@ from datetime import datetime
 import hashlib
 import ctypes
 import sys
+import socket
+import threading
+import queue
 
-INTERNAL_VERSION = "1.0.22" # This line is automatically updated by the script
+INTERNAL_VERSION = "1.0.80" # This line is automatically updated by the script
 
 def get_app_path():
     # Returns the folder where the script or .exe is located
@@ -131,15 +137,22 @@ class BVBWidget:
         fg_col = "#e0e0e0" if theme == "dark" else "#000000"
         
         self.root.title(f"BVB Monitor v{APP_VERSION}")
-        self.root.geometry("680x780")
+        self.root.geometry("565x780")
+        self.root.resizable(True, True)
+        self.root.minsize(480, 400)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=bg_col)
         
+        # Initial call to set max size
+        self.root.after(100, self.adjust_window_height)
+        
         # Tooltip handling - MUST BE BEFORE ANY TABLE INIT
         self.tw = None
+        self.detail_windows = {} # symbol -> DetailedChartWindow
 
         self.today_str = date.today().strftime("%Y-%m-%d")
         self.history_file = os.path.join(DATA_DIR, f"intraday_history_{self.today_str}.json")
+        self.loaded_historical = False
         self.history = self.load_history()
         
         self.last_variations = {}
@@ -147,6 +160,21 @@ class BVBWidget:
         self.countdown = 60
         self.market_status = "Necunoscut"
         self.stopped_for_today = False
+        self.is_updating = False
+        self.data_queue = queue.Queue()
+        
+        # Setup robust session
+        self.session = requests.Session()
+        retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,ro;q=0.8',
+            'Referer': 'https://www.bvb.ro/'
+        })
 
         self.main_frame = tk.Frame(root, bg=bg_col)
         self.main_frame.pack(fill="both", expand=True)
@@ -162,6 +190,17 @@ class BVBWidget:
         
         self.label_countdown = tk.Label(self.header_frame, text="Next: 60s", font=("Arial", 9), fg="gray", bg=bg_col)
         self.label_countdown.pack(side="left", padx=5)
+        
+        self.frame_conn = tk.Frame(self.header_frame, bg=bg_col)
+        self.frame_conn.pack(side="left", padx=10)
+        
+        self.label_net = tk.Label(self.frame_conn, text="Net: -", font=("Arial", 9), bg=bg_col, fg="gray")
+        self.label_net.pack(side="left")
+        
+        tk.Label(self.frame_conn, text=" | ", font=("Arial", 9), bg=bg_col, fg="gray").pack(side="left")
+        
+        self.label_bvb = tk.Label(self.frame_conn, text="BVB: -", font=("Arial", 9), bg=bg_col, fg="gray")
+        self.label_bvb.pack(side="left")
 
         # Theme Switcher
         self.dark_mode_var = tk.BooleanVar(value=(theme == "dark"))
@@ -183,32 +222,66 @@ class BVBWidget:
         tk.Label(self.main_frame, text="Acțiuni (Top 20 - Real Time)", font=("Arial", 10, "bold"), fg="darkgreen", bg=bg_col).pack(pady=(10, 5))
         self.frame_ctd = tk.Frame(self.main_frame)
         self.frame_ctd.pack(padx=10, pady=(0, 10), fill="both", expand=True)
-        self.table_ctd = CustomTable(self.frame_ctd, ["#", "Simbol", "Pret", "Var%", "Valoare", "BET", "Evolutie"], [30, 75, 80, 100, 110, 35, 120], self)
-
-        self.bet_components = self.fetch_bet_components()
-        self.update_data()
+        self.table_ctd = CustomTable(self.frame_ctd, ["#", "Simbol", "Pret", "Var%", "Valoare", "BET", "Evolutie"], [30, 75, 80, 100, 110, 35, 120], self, is_scrollable=True)
+        
+        # We start WITHOUT blocking components fetch
+        self.bet_components = {"TLV", "H2O", "SNP", "SNG", "BRD", "SNN", "TGN", "EL", "M", "DIGI", "TTS", "WINE", "BVB", "TRP", "ONE", "AQ", "SFC", "FP", "COTE", "PREB"}
+        
+        # Trigger first async update
+        self.root.after(500, self.trigger_update)
         self.tick()
 
     def fetch_bet_components(self):
         try:
-            r = requests.get("https://bvb.ro/FinancialInstruments/Indices/IndicesProfiles", timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-            tables = pd.read_html(StringIO(r.text))
+            r = self.session.get("https://www.bvb.ro/FinancialInstruments/Indices/IndicesProfiles", timeout=15)
+            # Use 'lxml' if possible as it's often more robust for BVB's tables
+            try:
+                tables = pd.read_html(StringIO(r.text), flavor='lxml')
+            except:
+                tables = pd.read_html(StringIO(r.text))
+                
             for df in tables:
                 if "Simbol" in df.columns and "Societate" in df.columns:
                     return set(df["Simbol"].astype(str).tolist())
         except Exception as e:
-            print("Eroare la preluarea componentelor BET:", e)
+            print("Eroare la preluarea componentelor BET (folosim fallback):", e)
         # Fallback list if fetching fails
         return {"TLV", "H2O", "SNP", "SNG", "BRD", "SNN", "TGN", "EL", "M", "DIGI", "TTS", "WINE", "BVB", "TRP", "ONE", "AQ", "SFC", "FP", "COTE", "PREB"}
 
     def load_history(self):
+        # 1. First try to load today's history if it has data
         if os.path.exists(self.history_file):
             try:
                 with open(self.history_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    if data: # If it has actual content, return it
+                        return data
             except Exception as e:
-                print(f"Eroare la citire istoric (posibil corupt). Va incepe un fisier nou: {e}")
+                print(f"Eroare la citire istoric (posibil corupt): {e}")
                 pass
+                
+        # 2. If today's file doesn't exist or is empty (e.g. market just opened or closed all day), load the most recent populated one
+        try:
+            files = [f for f in os.listdir(DATA_DIR) if f.startswith("intraday_history_") and f.endswith(".json")]
+            # Sort files descending (newest first)
+            files.sort(reverse=True)
+            
+            for file in files:
+                # Skip today's file since we just tried it or it's empty
+                if file == os.path.basename(self.history_file):
+                    continue
+                    
+                with open(os.path.join(DATA_DIR, file), 'r', encoding='utf-8') as f:
+                    try:
+                        data = json.load(f)
+                        if data: # Found a file with actual data
+                            self.loaded_historical = True
+                            return data
+                    except:
+                        pass
+        except:
+            pass
+            
         return {}
 
     def save_history(self):
@@ -231,30 +304,62 @@ class BVBWidget:
         except: pass
         return "Necunoscut"
 
-    def fetch_data(self):
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        indices, stocks_dict = [], {}
-        session = requests.Session()
-        session.headers.update(headers)
+    def check_connectivity(self):
+        # Quick check for internet and BVB
+        net_ok = False
+        bvb_ok = False
         
         try:
-            r1 = session.get("https://www.bvb.ro", timeout=10)
-            self.market_status = self.fetch_market_status(r1.text)
+            # Check Internet (Google DNS)
+            socket.create_connection(("8.8.8.8", 53), timeout=2).close()
+            net_ok = True
+        except: net_ok = False
+        
+        try:
+            # Check BVB
+            socket.create_connection(("www.bvb.ro", 443), timeout=2).close()
+            bvb_ok = True
+        except: bvb_ok = False
+        
+        theme = "dark" if self.dark_mode_var.get() else "light"
+        green_col = "#4caf50" if theme == "dark" else "green"
+        red_col = "#f44336" if theme == "dark" else "red"
+        
+        self.label_net.config(text=f"Net: ●", fg=green_col if net_ok else red_col)
+        self.label_bvb.config(text=f"BVB: ●", fg=green_col if bvb_ok else red_col)
+
+    def fetch_data(self):
+        indices, stocks_dict = [], {}
+        market_status = self.market_status
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Începere preluare date de pe www.bvb.ro...")
+        
+        try:
+            r1 = self.session.get("https://www.bvb.ro", timeout=15)
+            market_status = self.fetch_market_status(r1.text)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Status Piață: {market_status}")
             
-            pattern_idx = re.compile(r"i=([A-Z-]+)'.*?>(.*?)</span>.*?id='sp.*?'>(.*?)</span>.*?<span.*?>(.*?)</span>", re.DOTALL)
+            pattern_idx = re.compile(r"i=([A-Z-]+)'.*?>(.*?)</span>.*?id='sp\1'.*?>(.*?)</span>.*?<span.*?>([0-9.,+-]+%)</span>", re.DOTALL)
             idx_matches = pattern_idx.findall(r1.text)
             seen = set()
             for m in idx_matches:
                 symbol, name, val, var = m
                 if symbol not in seen:
-                    indices.append([symbol, val, var])
+                    indices.append([symbol, val.strip(), var.strip()])
                     seen.add(symbol)
-        except: pass
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Preluat {len(indices)} indici.")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Eroare la preluare indici/status: {e}")
 
         if not self.stopped_for_today:
             try:
-                r2 = session.get("https://www.bvb.ro/TradingAndStatistics/Trading/CurrentTradingDay", timeout=10)
-                tables = pd.read_html(StringIO(r2.text))
+                r2 = self.session.get("https://www.bvb.ro/TradingAndStatistics/Trading/CurrentTradingDay", timeout=15)
+                try:
+                    tables = pd.read_html(StringIO(r2.text), flavor='lxml')
+                except:
+                    tables = pd.read_html(StringIO(r2.text))
+                    
+                count = 0
                 for df in tables:
                     if "Simbol" in df.columns and "Valoare" in df.columns:
                         for _, row in df.iterrows():
@@ -262,10 +367,33 @@ class BVBWidget:
                                 s = str(row["Simbol"])
                                 if s == "Simbol" or len(s) > 10: continue
                                 stocks_dict[s] = [s, row["Pret"], row["Var. (%)"], row["Valoare"]]
+                                count += 1
                             except: continue
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Preluat {count} acțiuni.")
 
-                r3 = session.get("https://www.bvb.ro/TradingAndStatistics/Trading/CurrentTradingDay?tab=Unitati%20de%20fond", timeout=10)
-                tables_etf = pd.read_html(StringIO(r3.text))
+                # Extract postback form fields to load ETF / Unitati de fond tab
+                fields = {}
+                for name in ['__VIEWSTATE', '__VIEWSTATEGENERATOR', '__EVENTVALIDATION', '__VIEWSTATEENCRYPTED']:
+                    match = re.search(r'id="{}"\s+value="([^"]*)"'.format(name), r2.text)
+                    if not match:
+                        match = re.search(r'name="{}"\s+value="([^"]*)"'.format(name), r2.text)
+                    if match:
+                        fields[name] = match.group(1)
+
+                post_data = {
+                    '__EVENTTARGET': 'ctl00$ctl00$body$rightColumnPlaceHolder$TabsCtrlInstrumentsType$lb3',
+                    '__EVENTARGUMENT': '',
+                    '__LASTFOCUS': '',
+                }
+                post_data.update(fields)
+
+                r3 = self.session.post("https://www.bvb.ro/TradingAndStatistics/Trading/CurrentTradingDay", data=post_data, timeout=15)
+                try:
+                    tables_etf = pd.read_html(StringIO(r3.text), flavor='lxml')
+                except:
+                    tables_etf = pd.read_html(StringIO(r3.text))
+                    
+                etf_count = 0
                 for df in tables_etf:
                     if "Simbol" in df.columns and "Valoare" in df.columns:
                         for _, row in df.iterrows():
@@ -273,39 +401,89 @@ class BVBWidget:
                                 s = str(row["Simbol"])
                                 if s == "Simbol" or len(s) > 10: continue
                                 stocks_dict[s] = [s, row["Pret"], row["Var. (%)"], row["Valoare"]]
+                                etf_count += 1
                             except: continue
-            except: pass
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Preluat {etf_count} unități de fond / ETF.")
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Eroare la preluare acțiuni / ETF: {e}")
 
         all_stocks = list(stocks_dict.values())
         all_stocks.sort(key=lambda x: self.clean_numeric(x[3]), reverse=True)
-        return indices, all_stocks[:20]
+        return indices, all_stocks[:20], market_status
 
-    def update_data(self):
+    def trigger_update(self):
+        if self.is_updating: return
+        self.is_updating = True
+        self.label_status.config(text="Updating...")
+        threading.Thread(target=self.background_worker, daemon=True).start()
+        # Start checking the queue
+        self.root.after(100, self.process_queue)
+
+    def background_worker(self):
+        try:
+            # First-time fetch of components if we only have fallback
+            if len(self.bet_components) <= 20:
+                comps = self.fetch_bet_components()
+                if comps: self.bet_components = comps
+            
+            self.check_connectivity()
+            indices, stocks, market_status = self.fetch_data()
+            self.data_queue.put((indices, stocks, market_status))
+        except Exception as e:
+            import traceback
+            print(f"Bkg worker error:\n{traceback.format_exc()}")
+            self.data_queue.put(([], [], "Error"))
+
+    def process_queue(self):
+        try:
+            indices, stocks, market_status = self.data_queue.get_nowait()
+            self.update_ui_with_data(indices, stocks, market_status)
+            self.is_updating = False
+        except queue.Empty:
+            if self.is_updating:
+                self.root.after(100, self.process_queue)
+
+    def update_ui_with_data(self, indices, stocks, market_status):
         current_date_str = date.today().strftime("%Y-%m-%d")
         if current_date_str != self.today_str:
             self.today_str = current_date_str
             self.history_file = os.path.join(DATA_DIR, f"intraday_history_{self.today_str}.json")
             self.history = self.load_history()
 
-        indices, stocks = self.fetch_data()
+        self.market_status = market_status
         now_str = datetime.now().strftime("%H:%M:%S")
         
-        # update history
-        for row in indices:
-            sym = str(row[0])
-            val = self.clean_numeric(row[1])
-            self.add_to_history(sym, now_str, val)
+        # update history only if the market is open or we don't have historical data blocking it
+        is_market_closed = ("inchis" in self.market_status.lower() or "închis" in self.market_status.lower() or not self.is_market_hours())
+        
+        # Daca am incarcat istoric vechi si piata s-a deschis intre timp, il curatam ca sa nu amestecam zilele
+        if self.loaded_historical and not is_market_closed:
+            self.history = {}
+            self.loaded_historical = False
             
-        for row in stocks:
-            sym = str(row[0])
-            val = self.clean_numeric(row[1]) / 10000.0
-            self.add_to_history(sym, now_str, val)
+        if not (self.loaded_historical and is_market_closed):
+            for row in indices:
+                sym = str(row[0])
+                val = self.clean_numeric(row[1])
+                self.add_to_history(sym, now_str, val)
+                
+            for row in stocks:
+                sym = str(row[0])
+                val = self.clean_numeric(row[1]) / 10000.0
+                self.add_to_history(sym, now_str, val)
 
-        self.save_history()
+            self.save_history()
 
         # Update Tables
         self.table_ic.update_rows(indices, "Indici")
         self.table_ctd.update_rows(stocks, "Acțiuni")
+        
+        # Update Detail Windows
+        for symbol, win in list(self.detail_windows.items()):
+            try:
+                win.update_chart()
+            except Exception as e:
+                print(f"Error updating detail window for {symbol}: {e}")
         
         now = datetime.now()
         self.label_status.config(text=f"Update: {now.strftime('%H:%M:%S')}")
@@ -365,7 +543,13 @@ class BVBWidget:
         self.main_frame.configure(bg=bg_col)
         self.header_frame.configure(bg=bg_col)
         
-        self.label_market.configure(bg=bg_col, fg=fg_col)
+        self.label_market.configure(bg=bg_col)
+        # re-apply market status color based on theme
+        ms_lower = self.market_status.lower() if hasattr(self, 'market_status') else ""
+        if "deschis" in ms_lower: self.label_market.config(fg="#4caf50" if theme == "dark" else "green")
+        elif "inchis" in ms_lower or "închis" in ms_lower: self.label_market.config(fg="#f44336" if theme == "dark" else "red")
+        else: self.label_market.config(fg="orange")
+        
         self.label_status.configure(bg=bg_col, fg=fg_col)
         self.label_countdown.configure(bg=bg_col)
         self.check_theme.configure(bg=bg_col, fg=fg_col, selectcolor=bg_col, activebackground=bg_col, activeforeground=fg_col)
@@ -385,12 +569,42 @@ class BVBWidget:
         # Also update table internal state
         for table in (self.table_ic, self.table_ctd):
             table.apply_theme_colors(theme)
+        
+        self.adjust_window_height()
+
+    def adjust_window_height(self):
+        self.root.update_idletasks()
+        # The main_frame contains everything
+        needed_h = self.main_frame.winfo_reqheight()
+        
+        # Account for some padding/margin
+        screen_h = self.root.winfo_screenheight() - 100
+        final_h = min(needed_h, screen_h)
+        
+        # Limit the max height of the window to exactly what's needed
+        # We allow resizing width (up to screen width)
+        self.root.maxsize(self.root.winfo_screenwidth(), final_h)
+        
+        # If the window is currently taller than it should be, shrink it
+        if self.root.winfo_height() > final_h:
+            self.root.geometry(f"{self.root.winfo_width()}x{final_h}")
 
     def tick(self):
         now = datetime.now()
         if not self.is_market_hours():
             self.stopped_for_today = False
-            next_check = "Luni la 09:45" if now.weekday() >= 4 else "mâine la 09:45"
+            wd = now.weekday()
+            curr_t = now.time()
+            
+            if wd < 4: # Luni-Joi
+                if curr_t < time(9, 45): next_check = "azi la 09:45"
+                else: next_check = "mâine la 09:45"
+            elif wd == 4: # Vineri
+                if curr_t < time(9, 45): next_check = "azi la 09:45"
+                else: next_check = "Luni la 09:45"
+            else: # Sâmbătă-Duminică
+                next_check = "Luni la 09:45"
+                
             self.label_countdown.config(text=f"Revenim {next_check}", fg="orange")
             self.root.after(60000, self.tick)
             return
@@ -402,10 +616,22 @@ class BVBWidget:
 
         if self.countdown > 0:
             self.countdown -= 1
-            self.label_countdown.config(text=f"Next: {self.countdown}s", fg="gray")
+            
+            # Show market close countdown if open
+            close_str = ""
+            if self.is_market_hours():
+                closing_time = datetime.combine(now.date(), time(18, 0, 0))
+                remaining = closing_time - now
+                if remaining.total_seconds() > 0:
+                    hrs = int(remaining.total_seconds() // 3600)
+                    mins = int((remaining.total_seconds() % 3600) // 60)
+                    secs = int(remaining.total_seconds() % 60)
+                    close_str = f" | Închidere: {hrs:02d}:{mins:02d}:{secs:02d}"
+            
+            self.label_countdown.config(text=f"Next: {self.countdown}s{close_str}", fg="gray")
             self.root.after(1000, self.tick)
         else:
-            self.update_data()
+            self.trigger_update()
             self.countdown = 60
             self.tick()
 
@@ -474,8 +700,21 @@ class DetailedChartWindow:
             
         self.draw_chart()
         
-        # Bind native Tkinter motion event
-        self.canvas.get_tk_widget().bind("<Motion>", self.on_tk_motion)
+        # Handle window closure to clean up from app.detail_windows
+        self.top.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Bind native Tkinter motion and leave events
+        self.canvas_widget.bind("<Motion>", self.on_tk_motion)
+        self.canvas_widget.bind("<Leave>", self.on_mouse_leave)
+
+    def on_mouse_leave(self, event):
+        if hasattr(self, 'annot'):
+            self.annot.set_visible(False)
+            if hasattr(self, 'vline') and self.vline.get_visible():
+                self.vline.set_visible(False)
+                self.hline.set_visible(False)
+                self.hover_point.set_visible(False)
+            self.canvas.draw_idle()
 
     def on_tk_motion(self, event):
         # Convert raw tk pixels to matplotlib data coordinates manually
@@ -594,11 +833,6 @@ class DetailedChartWindow:
                                   bbox=dict(boxstyle="round", fc=bg_color, ec=ref_line_color, alpha=0.9),
                                   color=text_color, fontsize=10, zorder=100, visible=False)
         
-        # Pre-hover message in a fixed corner
-        self.msg_annot = self.ax.text(0.98, 0.95, "Mișcați mouse-ul pe grafic pentru detalii", 
-                                      transform=self.ax.transAxes, ha="right", va="top",
-                                      color=text_color, alpha=0.7, fontsize=9)
-        
         self.vline, = self.ax.plot([], [], color=crosshair_color, linestyle='--', alpha=0.3, zorder=99, visible=False)
         self.hline, = self.ax.plot([], [], color=crosshair_color, linestyle='--', alpha=0.3, zorder=99, visible=False)
         dot_color = "#ffffff" if theme == "dark" else "#000000"
@@ -611,13 +845,26 @@ class DetailedChartWindow:
         self.ax.tick_params(colors=text_color)
         
         def price_fmt(x, pos):
+            if x >= 100:
+                s = f"{x:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+                if s.endswith(",00"): s = s[:-3]
+                return s
             return f"{x:,.4f}".replace(',', 'X').replace('.', ',').replace('X', '.')
         self.ax.yaxis.set_major_formatter(ticker.FuncFormatter(price_fmt))
         
         all_prices = self.points_y + [ref_price]
         min_p, max_p = min(all_prices), max(all_prices)
+        
+        # Ensure reference price is a baseline if possible
+        # If all prices are above ref_price, make ref_price the bottom limit
+        if min(self.points_y) >= ref_price:
+            min_p = ref_price
+        # If all prices are below ref_price, make ref_price the top limit
+        elif max(self.points_y) <= ref_price:
+            max_p = ref_price
+            
         diff_p = (max_p - min_p) or 1
-        self.ax.set_ylim(min_p - diff_p * 0.1, max_p + diff_p * 0.1)
+        self.ax.set_ylim(min_p - diff_p * 0.05, max_p + diff_p * 0.1)
         
         for spine in self.ax.spines.values():
             spine.set_color(grid_color)
@@ -630,6 +877,20 @@ class DetailedChartWindow:
                      ha='right', va='center', transform=trans, fontsize=9, 
                      bbox=dict(facecolor=fig_bg, edgecolor='none', pad=0))
 
+        if len(self.points_y) > 0:
+            p_min_y = min(self.points_y)
+            p_max_y = max(self.points_y)
+            p_min_x = self.points_x[self.points_y.index(p_min_y)]
+            p_max_x = self.points_x[self.points_y.index(p_max_y)]
+            
+            self.ax.text(p_max_x, p_max_y + (diff_p * 0.02), "▼", color=green, fontsize=12, ha='center', va='bottom', zorder=5)
+            self.ax.text(p_min_x, p_min_y - (diff_p * 0.02), "▲", color=red, fontsize=12, ha='center', va='top', zorder=5)
+
+            # Mark latest point with a blue dot
+            last_x = self.points_x[-1]
+            last_y = self.points_y[-1]
+            self.ax.plot(last_x, last_y, 'o', color='#00aaff', markersize=8, markeredgecolor='white', zorder=102)
+
         self.fig.tight_layout()
         # Final redraw with position update
         self.canvas.draw()
@@ -638,8 +899,6 @@ class DetailedChartWindow:
         if not self.points_x or event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             if hasattr(self, 'annot'):
                 self.annot.set_visible(False)
-                if hasattr(self, 'msg_annot'):
-                    self.msg_annot.set_visible(True)
                 if self.vline.get_visible():
                     self.vline.set_visible(False)
                     self.hline.set_visible(False)
@@ -661,7 +920,11 @@ class DetailedChartWindow:
             var_pct = (snapped_y - ref) / ref * 100
         sign = "+" if var_pct > 0 else ""
         
-        price_str = f"{snapped_y:,.4f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+        if snapped_y >= 100:
+            price_str = f"{snapped_y:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+            if price_str.endswith(",00"): price_str = price_str[:-3]
+        else:
+            price_str = f"{snapped_y:,.4f}".replace(',', 'X').replace('.', ',').replace('X', '.')
         text = f"Ora: {time_str[:5]}\nPreț: {price_str}"
         if ref and ref > 0:
             text += f"\nVar: {sign}{var_pct:.2f}%"
@@ -684,9 +947,6 @@ class DetailedChartWindow:
         self.annot.set_va("top")
         self.annot.set_visible(True)
         
-        if hasattr(self, 'msg_annot'):
-            self.msg_annot.set_visible(False)
-        
         # Crosshair lines STILL SNAP
         y_min, y_max = self.ax.get_ylim()
         self.vline.set_data([snapped_x, snapped_x], [y_min, y_max])
@@ -698,13 +958,67 @@ class DetailedChartWindow:
         
         self.canvas.draw()
 
+    def update_chart(self):
+        # Refresh the history reference in case it changed (though usually pointing to same dict)
+        self.history = self.app.history
+        self.draw_chart()
+
+    def on_close(self):
+        # Remove self from the app's tracking dictionary
+        if self.symbol in self.app.detail_windows:
+            del self.app.detail_windows[self.symbol]
+        self.top.destroy()
+
+
+class CustomScrollbar(tk.Canvas):
+    def __init__(self, parent, command=None, **kwargs):
+        tk.Canvas.__init__(self, parent, width=4, highlightthickness=0, borderwidth=0, **kwargs)
+        self.command = command
+        self.slider = self.create_rectangle(0, 0, 4, 0, fill="#555555", outline="")
+        self.bind("<Button-1>", self.on_click)
+        self.bind("<B1-Motion>", self.on_drag)
+        self.slider_pos = (0, 1)
+        self.bind("<Configure>", lambda e: self.update_slider_pos())
+
+    def set_colors(self, track_bg, slider_fg):
+        self.configure(bg=track_bg)
+        self.itemconfig(self.slider, fill=slider_fg)
+
+    def set(self, start, end):
+        self.slider_pos = (float(start), float(end))
+        self.update_slider_pos()
+
+    def update_slider_pos(self):
+        h = self.winfo_height()
+        if h <= 1: return
+        start, end = self.slider_pos
+        y1 = start * h
+        y2 = end * h
+        if y2 - y1 < 20:
+             center = (y1 + y2) / 2
+             y1 = max(0, center - 10)
+             y2 = min(h, y1 + 20)
+        self.coords(self.slider, 0, y1, 4, y2)
+
+    def on_click(self, event):
+        if self.command:
+            h = self.winfo_height()
+            if h > 0:
+                self.command("moveto", max(0, min(1, event.y / h - (self.slider_pos[1]-self.slider_pos[0])/2)))
+
+    def on_drag(self, event):
+        if self.command:
+            h = self.winfo_height()
+            if h > 0:
+                self.command("moveto", max(0, min(1, event.y / h - (self.slider_pos[1]-self.slider_pos[0])/2)))
 
 class CustomTable:
-    def __init__(self, parent, columns, widths, app):
+    def __init__(self, parent, columns, widths, app, is_scrollable=False):
         self.parent = parent
         self.columns = columns
         self.widths = widths
         self.app = app
+        self.is_scrollable = is_scrollable
         self.rows_data = []
         self.row_widgets = [] # Store references: (frame, {column_name: widget})
         self.sort_col = ""
@@ -715,24 +1029,50 @@ class CustomTable:
 
         self.header_frame = tk.Frame(parent, bg=self.header_bg)
         self.header_frame.pack(fill="x")
-        self.body_frame = tk.Frame(parent, bg=self.body_bg)
-        self.body_frame.pack(fill="both", expand=True)
+        
+        if self.is_scrollable:
+            self.container = tk.Frame(parent, bg=self.body_bg)
+            self.container.pack(fill="both", expand=True)
+            
+            self.canvas = tk.Canvas(self.container, bg=self.body_bg, highlightthickness=0)
+            self.scrollbar = CustomScrollbar(self.container, command=self.canvas.yview)
+            self.body_frame = tk.Frame(self.canvas, bg=self.body_bg)
+            
+            self.canvas.create_window((0, 0), window=self.body_frame, anchor="nw")
+            self.canvas.configure(yscrollcommand=self.scrollbar.set)
+            
+            self.scrollbar.pack(side="right", fill="y", padx=(2, 0))
+            self.canvas.pack(side="left", fill="both", expand=True)
+            
+            self.body_frame.bind("<Configure>", self._update_scrollbar)
+            self.canvas.bind("<Configure>", self._update_scrollbar)
+            self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        else:
+            self.body_frame = tk.Frame(parent, bg=self.body_bg)
+            self.body_frame.pack(fill="both", expand=True)
         
         self.render_header()
 
     def apply_theme_colors(self, theme):
         self.header_bg = "#2d2d30" if theme == "dark" else "#d3d3d3"
         self.header_fg = "#ffffff" if theme == "dark" else "#000000"
-        self.body_bg = "#1e1e1e" if theme == "dark" else "white"
+        self.body_bg = "#121212" if theme == "dark" else "white"
         self.text_fg = "#e0e0e0" if theme == "dark" else "black"
-        self.row_alt_bg = "#252526" if theme == "dark" else "#f2f2f2"
+        self.row_alt_bg = "#1e1e1e" if theme == "dark" else "#f9f9f9"
         self.highlight_bg = "#082846" if theme == "dark" else "#ffffcc"
         self.neutral_fg = "#aaaaaa" if theme == "dark" else "#555555"
+        self.slider_fg = "#444444" if theme == "dark" else "#cccccc"
         
         if hasattr(self, 'header_frame'):
             self.header_frame.configure(bg=self.header_bg)
         if hasattr(self, 'body_frame'):
             self.body_frame.configure(bg=self.body_bg)
+        if hasattr(self, 'canvas'):
+            self.canvas.configure(bg=self.body_bg)
+        if hasattr(self, 'container'):
+            self.container.configure(bg=self.body_bg)
+        if hasattr(self, 'scrollbar'):
+            self.scrollbar.set_colors(self.body_bg, self.slider_fg)
         self.render_header()
 
     def render_header(self):
@@ -841,6 +1181,33 @@ class CustomTable:
                 w.configure(bg=bg_color)
             except:
                 pass
+        
+        if self.is_scrollable:
+            self._update_scrollbar()
+
+    def _update_scrollbar(self, event=None):
+        if not self.is_scrollable: return
+        self.body_frame.update_idletasks()
+        bbox = self.canvas.bbox("all")
+        if not bbox: return
+        self.canvas.configure(scrollregion=bbox)
+        
+        content_h = bbox[3] - bbox[1]
+        canvas_h = self.canvas.winfo_height()
+        
+        if content_h <= canvas_h:
+            if self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack_forget()
+        else:
+            if not self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack(side="right", fill="y", padx=(1, 0))
+
+        # Dynamically Adjust Main Window height to content
+        self.app.adjust_window_height()
+
+    def _on_mousewheel(self, event):
+        if not self.is_scrollable: return
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
     def render_rows(self):
         for widget in self.body_frame.winfo_children():
@@ -900,7 +1267,7 @@ class CustomTable:
                     self.draw_sparkchart(canv, row["Simbol"], row["_fg"], ref_price)
                     canv.bind("<Motion>", lambda e, s=row["Simbol"], c=canv: self.on_hover(e, s, c))
                     canv.bind("<Leave>", self.app.hide_tooltip)
-                    canv.bind("<Button-1>", lambda e, s=row["Simbol"], ref=ref_price: DetailedChartWindow(self.app, s, ref))
+                    canv.bind("<Button-1>", lambda e, s=row["Simbol"], ref=ref_price: self.open_detail_chart(s, ref))
                     widgets_map[col] = canv
                 else:
                     if col == "#":
@@ -929,6 +1296,21 @@ class CustomTable:
                     widgets_map[col] = lbl
                 row_frame.columnconfigure(c_idx, minsize=self.widths[c_idx])
             self.row_widgets.append((row_frame, widgets_map))
+
+    def open_detail_chart(self, symbol, ref_price):
+        if symbol in self.app.detail_windows:
+            win = self.app.detail_windows[symbol]
+            try:
+                win.top.lift()
+                win.top.focus_set()
+                return
+            except:
+                # If window was destroyed but not removed for some reason
+                pass
+        
+        # Create new window and track it
+        new_win = DetailedChartWindow(self.app, symbol, ref_price)
+        self.app.detail_windows[symbol] = new_win
 
     def draw_sparkchart(self, canvas, symbol, color_hint, ref_price=None):
         canvas.delete("all")
@@ -1018,6 +1400,18 @@ class CustomTable:
             last_side = "green" if last_y <= ref_y else "red"
             last_line_c = line_green if last_side == "green" else line_red
             canvas.create_oval(last_x-2, last_y-2, last_x+2, last_y+2, fill=last_line_c, outline="")
+            
+            # Adauga sageti pentru Min si Max pe sparkline
+            if len(coords) > 1:
+                # Punctul Y minim pe ecran inseamna Pretul Maxim
+                max_price_coord = min(coords, key=lambda c: c[1])
+                # Punctul Y maxim pe ecran inseamna Pretul Minim
+                min_price_coord = max(coords, key=lambda c: c[1])
+                
+                # Sageata verde jos pentru Max (rezistenta)
+                canvas.create_text(max_price_coord[0], max_price_coord[1] - 5, text="▼", fill=line_green, font=("Arial", 6))
+                # Sageata rosie sus pentru Min (suport)
+                canvas.create_text(min_price_coord[0], min_price_coord[1] + 5, text="▲", fill=line_red, font=("Arial", 6))
 
     def on_hover(self, event, symbol, canvas):
         pts = self.app.history.get(symbol, [])
@@ -1079,3 +1473,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = BVBWidget(root)
     root.mainloop()
+
